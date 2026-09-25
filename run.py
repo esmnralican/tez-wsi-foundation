@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from tez import barcode, cohort as cohort_mod
+from tez import barcode, cohort as cohort_mod, wsi as wsi_mod
 
 
 # ------------------------------------------------------------------ cohort
@@ -45,6 +45,25 @@ def cmd_cohort(args):
     print(f"  excluded.csv : {ep}")
     print(f"\n  siradaki adim: python run.py check --out {args.out} "
           f"--expect-wsi {len(rows)}")
+
+
+# ------------------------------------------------------------------ wsi-qc
+
+def cmd_wsi_qc(args):
+    """Asama 2: fiziksel olcek analizi."""
+    out = Path(args.out).expanduser()
+    cohort_csv = out / "cohort.csv"
+    if not cohort_csv.exists():
+        sys.exit(f"[DUR] {cohort_csv} yok -- once 'run.py cohort' calistir")
+
+    results, qc_path = wsi_mod.run(
+        cohort_csv, args.slides, out,
+        target_mpp=args.target_mpp, patch_px=args.patch_px,
+        limit=args.limit, read_test_on=not args.no_read_test)
+
+    wsi_mod.report(results, args.target_mpp, args.patch_px)
+    print(f"\n  wsi_qc.csv : {qc_path}")
+    print(f"\n  siradaki adim: python run.py check --out {out}")
 
 
 # ------------------------------------------------------------------- check
@@ -118,10 +137,47 @@ def cmd_check(args):
     for reason, n in Counter(r["reason"] for r in excl).most_common():
         print(f"      {n:>4}  {reason}")
 
+    # --- asama 2: wsi_qc.csv varsa onu da dogrula ---
+    qc_path = out / "wsi_qc.csv"
+    if qc_path.exists():
+        qc = _load(qc_path)
+        print(f"\n{'='*70}\nWSI QC DOGRULAMA\n{'='*70}")
+
+        ids_c = {r["file_name"].split(".")[0] for r in rows}
+        ids_q = {r["wsi_id"] for r in qc}
+        check("wsi_qc kohortla ayni WSI'lari kapsiyor", ids_c == ids_q,
+              f"(kohort {len(ids_c)} / qc {len(ids_q)})")
+
+        unread = [r for r in qc if r["readable"] != "True"]
+        check("tum WSI openslide ile acilabiliyor", not unread,
+              f"({len(unread)} acilamadi)" if unread else "")
+
+        no_mpp = [r for r in qc if not r["base_mpp_x"]]
+        check("tum WSI'da MPP okunabiliyor", not no_mpp,
+              f"({len(no_mpp)} MPP'siz)" if no_mpp else "")
+
+        bad = [r for r in qc if r["status"] not in ("ok",)]
+        check("tum WSI status=ok", not bad,
+              f"({Counter(r['status'] for r in bad).most_common()})" if bad else "")
+
+        up = [r for r in qc if r["downscale_factor"]
+              and float(r["downscale_factor"]) > 1.05]
+        check("hicbir WSI yukari olceklenmiyor", not up,
+              f"({len(up)} WSI hedefe ulasamiyor)" if up else "")
+
+        okq = [r for r in qc if r["status"] == "ok"]
+        if okq:
+            print(f"\n  olculen MPP gruplari:")
+            for m, n in Counter(round(float(r["base_mpp_x"]), 2)
+                                for r in okq).most_common():
+                print(f"      {n:>4}  {m:.2f} um/px")
+            print(f"  secilen level: "
+                  f"{dict(Counter(r['chosen_level'] for r in okq))}")
+
     if problems:
         print(f"\n[DUR] {len(problems)} kontrol basarisiz. Sonraki asamaya GECME.")
         sys.exit(1)
-    print("\n[GECTI] Kohort dogrulandi. Sonraki asamaya gecebilirsin.")
+    print("\n[GECTI] Tum kontroller gecti. Sonraki asamaya gecebilirsin.")
 
 
 # ------------------------------------------------------------------- sites
@@ -149,7 +205,18 @@ def main():
     c.add_argument("--out", required=True)
     c.set_defaults(func=cmd_cohort)
 
-    k = sub.add_parser("check", help="kohortu dogrula")
+    w = sub.add_parser("wsi-qc", help="fiziksel olcek analizi (asama 2)")
+    w.add_argument("--slides", required=True,
+                   help="ornek: ~/tcga_data/LUAD")
+    w.add_argument("--out", required=True, help="cohort.csv'nin bulundugu klasor")
+    w.add_argument("--target-mpp", type=float, default=0.50)
+    w.add_argument("--patch-px", type=int, default=224)
+    w.add_argument("--limit", type=int, default=0, help="ilk N WSI (pilot)")
+    w.add_argument("--no-read-test", action="store_true",
+                   help="okuma testini atla (daha hizli)")
+    w.set_defaults(func=cmd_wsi_qc)
+
+    k = sub.add_parser("check", help="asamalari dogrula")
     k.add_argument("--out", required=True)
     k.add_argument("--expect-wsi", type=int, default=None)
     k.set_defaults(func=cmd_check)
