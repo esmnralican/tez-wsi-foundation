@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from tez import barcode, cohort as cohort_mod, wsi as wsi_mod
+from tez import barcode, cohort as cohort_mod, wsi as wsi_mod, patches as patch_mod
 
 
 # ------------------------------------------------------------------ cohort
@@ -64,6 +64,83 @@ def cmd_wsi_qc(args):
     wsi_mod.report(results, args.target_mpp, args.patch_px)
     print(f"\n  wsi_qc.csv : {qc_path}")
     print(f"\n  siradaki adim: python run.py check --out {out}")
+
+
+# -------------------------------------------------------------- patch-scan
+
+PATCH_CFG = {
+    "target_mpp": 0.50,      # um/px  -- canonical fiziksel olcek
+    "patch_px": 224,         # px     -- model input (uc model de 224)
+    "stride_um": 112.0,      # um     -- 224 * 0.50, overlap yok
+    "mask_thumb_dim": 2048,
+    "seed": 42,              # wsi_id ile birlestirilir -> deterministik
+    "jpeg_quality": 95,
+}
+
+
+def cmd_patch_scan(args):
+    """Asama 3a: tavansiz aday tarama. Esik/tavan UYGULAMAZ, olcer."""
+    out = Path(args.out).expanduser()
+    cohort_csv = out / "cohort.csv"
+    qc_csv = out / "wsi_qc.csv"
+    for p in (cohort_csv, qc_csv):
+        if not p.exists():
+            sys.exit(f"[DUR] {p} yok -- onceki asamayi calistir")
+
+    cfg = dict(PATCH_CFG)
+    cfg["target_mpp"] = args.target_mpp
+    cfg["patch_px"] = args.patch_px
+    cfg["stride_um"] = args.stride_um or args.patch_px * args.target_mpp
+
+    results, sp = patch_mod.scan(cohort_csv, qc_csv, args.slides, out,
+                                 cfg, limit=args.limit)
+    if results:
+        patch_mod.scan_report(results)
+    print(f"\n  scan_summary.csv : {sp}")
+    print(f"  candidates/      : {out / 'candidates'}")
+    print(f"\n  Bu ciktiya bakarak tissue_threshold ve max_patches secilecek.")
+
+
+# ---------------------------------------------------- patch-manifest / extract
+
+def cmd_patch_manifest(args):
+    """Asama 3b: esik + tavan uygulayip ortak koordinat kaynagini uret."""
+    out = Path(args.out).expanduser()
+    for n in ("cohort.csv", "wsi_qc.csv"):
+        if not (out / n).exists():
+            sys.exit(f"[DUR] {out/n} yok")
+    if not (out / "candidates").is_dir():
+        sys.exit(f"[DUR] {out/'candidates'} yok -- once patch-scan calistir")
+
+    cfg = dict(PATCH_CFG)
+    cfg["target_mpp"] = args.target_mpp
+    cfg["patch_px"] = args.patch_px
+
+    patch_mod.build_manifest(out, out / "cohort.csv", out / "wsi_qc.csv", cfg,
+                             tissue_min=args.tissue_min, cap=args.cap,
+                             oversample=args.oversample,
+                             pen_max=args.pen_max)
+    print(f"\n  siradaki adim: python run.py patch-extract "
+          f"--slides <yol> --out {out} --limit 10")
+
+
+def cmd_patch_extract(args):
+    """Asama 3c: gercek JPEG patch'leri yaz."""
+    out = Path(args.out).expanduser()
+    cfg = dict(PATCH_CFG)
+    cfg["target_mpp"] = args.target_mpp
+    cfg["patch_px"] = args.patch_px
+    cfg["jpeg_quality"] = args.jpeg_quality
+
+    metrics, fp = patch_mod.extract(
+        out, args.slides, cfg, cap=args.cap,
+        blur_min=args.blur_min, ink_max=args.ink_max,
+        tissue_min=args.tissue_min, limit=args.limit,
+        per_tss=args.per_tss, res_max=args.res_max,
+        hema_min=args.hema_min)
+    patch_mod.extract_report(metrics)
+    print(f"\n  final_patch_manifest.csv : {fp}")
+    print(f"  patches/                 : {out / 'patches'}")
 
 
 # ------------------------------------------------------------------- check
@@ -215,6 +292,52 @@ def main():
     w.add_argument("--no-read-test", action="store_true",
                    help="okuma testini atla (daha hizli)")
     w.set_defaults(func=cmd_wsi_qc)
+
+    ps = sub.add_parser("patch-scan", help="tavansiz aday tarama (asama 3a)")
+    ps.add_argument("--slides", required=True)
+    ps.add_argument("--out", required=True)
+    ps.add_argument("--target-mpp", type=float, default=0.50)
+    ps.add_argument("--patch-px", type=int, default=224)
+    ps.add_argument("--stride-um", type=float, default=None,
+                    help="varsayilan: patch_px * target_mpp (overlap yok)")
+    ps.add_argument("--limit", type=int, default=0)
+    ps.set_defaults(func=cmd_patch_scan)
+
+    pm = sub.add_parser("patch-manifest", help="ortak koordinat kaynagi (asama 3b)")
+    pm.add_argument("--out", required=True)
+    pm.add_argument("--tissue-min", type=float, default=0.80,
+                    help="thumbnail doku orani alt siniri")
+    pm.add_argument("--cap", type=int, default=2000, help="WSI basina hedef")
+    pm.add_argument("--pen-max", type=float, default=0.01,
+                    help="patch'in kalem izi degen max orani")
+    pm.add_argument("--oversample", type=float, default=1.5,
+                    help="QC elemesi icin fazladan aday orani")
+    pm.add_argument("--target-mpp", type=float, default=0.50)
+    pm.add_argument("--patch-px", type=int, default=224)
+    pm.set_defaults(func=cmd_patch_manifest)
+
+    pe = sub.add_parser("patch-extract", help="JPEG patch yaz (asama 3c)")
+    pe.add_argument("--slides", required=True)
+    pe.add_argument("--out", required=True)
+    pe.add_argument("--cap", type=int, default=2000)
+    pe.add_argument("--blur-min", type=float, default=0.0,
+                    help="0 = eleme yok, sadece olc")
+    pe.add_argument("--ink-max", type=float, default=1.0,
+                    help="eski hue-tabanli olcum (onerilmez)")
+    pe.add_argument("--res-max", type=float, default=1.0,
+                    help="H&E deconvolution kalintisi ust siniri (murekkep)")
+    pe.add_argument("--hema-min", type=float, default=0.0,
+                    help="hematoksilen/cekirdek orani alt siniri (hucresellik)")
+    pe.add_argument("--tissue-min", type=float, default=0.0,
+                    help="patch'in KENDI piksellerindeki doku orani")
+    pe.add_argument("--jpeg-quality", type=int, default=95)
+    pe.add_argument("--target-mpp", type=float, default=0.50)
+    pe.add_argument("--patch-px", type=int, default=224)
+    pe.add_argument("--limit", type=int, default=0,
+                    help="ilk N WSI (alfabetik -- tek merkezden gelir!)")
+    pe.add_argument("--per-tss", type=int, default=0,
+                    help="her kaynak merkezden N WSI (temsili pilot icin)")
+    pe.set_defaults(func=cmd_patch_extract)
 
     k = sub.add_parser("check", help="asamalari dogrula")
     k.add_argument("--out", required=True)
