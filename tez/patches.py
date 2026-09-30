@@ -29,6 +29,7 @@ DIKKAT EDILEN NOKTALAR (docs/patch_kararlari.md)
   1.10 tss kolonu manifest'te tutulur (site-aware analizler icin)
 """
 import csv
+import hashlib
 import json
 import time
 from collections import Counter
@@ -451,8 +452,13 @@ def build_manifest(out_dir, cohort_csv, qc_csv, cfg,
                 continue
 
             # deterministik karistirma
-            rng = np.random.default_rng(
-                abs(hash((cfg["seed"], wid))) % (2 ** 32))
+            # NOT: Python'da str hash'i surec basina rastgele tuzlanir
+            # (PYTHONHASHSEED). hash() kullanmak "sabit seed ile
+            # deterministik ornekleme" iddiasini gecersiz kilar.
+            # blake2b surecten bagimsiz, her zaman ayni sonucu verir.
+            h = hashlib.blake2b(f"{cfg['seed']}:{wid}".encode(),
+                                digest_size=8).digest()
+            rng = np.random.default_rng(int.from_bytes(h, "big") % (2 ** 32))
             idx = rng.permutation(len(cands))
             want = int(cap * oversample)
             picked = [cands[i] for i in idx[:want]]
