@@ -218,3 +218,112 @@ doğrudan etkiler. Kümelenme morfolojiye değil merkeze göre oluşabilir.
 **Önlem:** Mapper grafiği bir kez sınıfa, bir kez TSS'e göre
 renklendirilecek. İki renklendirme aynı yapıyı gösteriyorsa kümelenme
 morfolojik değil, merkez kaynaklıdır.
+
+
+---
+
+## 7 · MERKEZ BAZINDA HATA — ⚠ TEZE KESİN EKLENECEK
+
+**Bu tablo, ortalama metriklerin gizlediği etkiyi doğrudan gösterir ve
+tez metnine mutlaka girecektir.**
+
+DINOv2, 100 patch/WSI, 5-fold. Aynı merkezlerin iki bölmedeki hata
+oranları:
+
+| TSS | Sınıf | n | patient bölme | site bölme | artış |
+|---|---|---:|---:|---:|---:|
+| **66** | LUSC | 38 | **%5** | **%58** | **11×** |
+| 55 | LUAD | 91 | %33 | %60 | 1,8× |
+| 05 | LUAD | 24 | %25 | %50 | 2,0× |
+| MP | LUAD | 19 | %16 | %47 | 2,9× |
+| 38 | LUAD | 11 | %45 | %45 | — |
+
+### 7.1 · TSS 66 — ezberin kanıtı
+
+Merkez eğitim kümesindeyken model 38 slaydın 36'sını doğru
+sınıflandırmaktadır (%5 hata). Aynı merkez eğitimden çıkarıldığında
+38 slaydın 22'sini yanlış sınıflandırmaktadır (%58 hata).
+
+İkili sınıflandırmada şans seviyesi %50'dir. **%58 hata, şanstan
+kötüdür** — model o merkezin tamamını sistematik olarak ters sınıfa
+atamaktadır. Bu gürültü değil, yön hatasıdır.
+
+Yorum: Model bu merkezin morfolojisini öğrenmemiş, *"bu merkezin
+görünümü = LUSC"* kuralını ezberlemiştir. Kural eğitim verisinde %100
+doğru olduğu için hiçbir ceza almamıştır. Yabancı merkez olarak
+karşısına çıktığında elinde kullanacak morfolojik bilgi kalmamıştır.
+
+### 7.2 · TSS 55 — kohortun %10'u
+
+91 slayt (kohortun yaklaşık %10'u), site bölmesinde %60 hata.
+Tek başına ortalama doğruluğu aşağı çeken en büyük kalem.
+
+### 7.3 · TSS 38 — karşı örnek
+
+İki bölmede de %45. Ezberlenmemiş; muhtemelen gerçekten zor slaytlar.
+n=11 olduğu için yorum temkinli yapılmalıdır. Bu örnek, etkinin her
+merkezde aynı olmadığını gösterir.
+
+### 7.4 · Neden ortalama metrik yetersiz
+
+Ortalama AUC farkı −0,049 olarak görünür ve küçük sanılabilir. Aynı
+veri merkez bazında incelendiğinde tablo değişir: tek bir merkezde hata
+oranı %5'ten %58'e çıkmaktadır.
+
+**Tezde yalnızca ortalama metrik raporlamak, bu tabloyu gizlemek
+anlamına gelir.**
+
+> **Yapılacak:** Bu analiz tüm merkezler için üretilecek, dağılım
+> (ör. hata oranı histogramı) tezde verilecektir. Tam embedding
+> (2000 patch) ile tekrarlanacaktır.
+
+---
+
+## 8 · "MODELİN MORFOLOJİ ÖĞRENMESİ" NEDEN DOĞRUDAN SAĞLANAMIYOR
+
+Modele "merkez bilgisini kullanma, morfolojiyi kullan" demek bu veri
+setinde mümkün değildir.
+
+Ortak merkez sayısı sıfır olduğundan, eğitim verisinde
+*"bu slayt TSS 66'dan gelmektedir"* ile *"bu slayt LUSC'tir"*
+ifadeleri **birebir aynı bilgidir.** Merkez bilgisini çıkaran herhangi
+bir yöntem, sınıf bilgisini de çıkarır.
+
+### 8.1 · Domain-adversarial eğitim neden çalışmaz
+
+Gradyan tersine çevirme ile merkez bilgisinin bastırılması, literatürde
+merkezlerin **karışık sınıflı** olduğu veri setlerinde işe yarar: model
+"merkezi unut, sınıfı tut" diyebilir.
+
+Bu veri setinde böyle bir ayrım yoktur. Adversarial kayıp, sınıflandırma
+kaybıyla doğrudan çelişir ve sınıflandırıcıyı çökertir.
+
+### 8.2 · Uygulanabilir yollar
+
+| Yöntem | Ne yapar | Bu çalışmada |
+|---|---|---|
+| Domain-adversarial | Merkez bilgisini bastırır | ❌ Sınıfı da siler |
+| Stain normalization | Rengi hizalar | ◐ Kısmi (%90→%80) |
+| Ağır augmentation | Kestirme yolu güvenilmez kılar | ⬜ Denenecek |
+| Gri tonlama ablasyonu | Rengi tamamen çıkarır | ⬜ Denenecek |
+| Harici kohort (CPTAC) | Konfoundu baypas eder | ⬜ Takvime bağlı |
+| Ölçüp raporlamak | Çözmez, dürüstleştirir | ✅ Zorunlu |
+
+### 8.3 · Benimsenen duruş
+
+Bu çalışmanın iddiası **batch effect'i çözmek değildir.** İddia, üç
+foundation model'in merkez etkisi kontrol altında karşılaştırılmasıdır.
+
+Literatürün büyük bölümü TCGA LUAD/LUSC üzerinde çalışırken bu kontrolü
+yapmamaktadır. Her iki bölmenin de raporlanması ve merkez bazında hata
+tablosunun verilmesi, bu çalışmanın metodolojik katkısıdır.
+
+### 8.4 · Planlanan ek deneyler
+
+**Augmentation ablasyonu** — eğitim sırasında renk sarsması, hafif
+bulanıklık, JPEG gürültüsü. Site bölmesindeki skoru iyileştirirse bu
+başlı başına bir bulgudur.
+
+**Gri tonlama ablasyonu** — patch'ler griye çevrilip aynı deney
+koşulur. Performans korunursa morfoloji taşıyor, çökerse renk
+yapıyordu demektir. Düşük maliyetli, yüksek bilgi değerli.
