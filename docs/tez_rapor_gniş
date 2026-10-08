@@ -1,0 +1,791 @@
+# TCGA-LUAD / LUSC ALT TİP SINIFLANDIRMASI — YÖNTEM VE BULGULAR
+
+DINOv2 temel modeli ile donuk öznitelik çıkarma, dikkat tabanlı çoklu
+örnek öğrenmesi ve merkez etkisinin ölçümü.
+
+Tarih: 8 Ekim 2026
+Aşama: DINOv2 tamamlandı · UNI ve Virchow sırada
+
+---
+
+## İÇİNDEKİLER
+
+1. Kullanılan terimler
+2. Veri kümesi ve kohort tanımı
+3. Fiziksel ölçek standardizasyonu
+4. Patch çıkarma ve kalite kontrolü
+5. Mürekkep tespiti
+6. Öznitelik çıkarma (embedding)
+7. Slayt seviyesi sınıflandırma
+8. Değerlendirme tasarımı — iki bölme şeması
+9. Bulgular
+10. Tartışma — ne kanıtlandı, ne kanıtlanmadı
+11. Sonraki adımlar
+
+---
+
+# 1 · KULLANILAN TERİMLER
+
+Bu bölüm, raporun geri kalanında geçen teknik terimlerin bu çalışmadaki
+karşılığını verir.
+
+**WSI (Whole Slide Image).** Patoloji camının tamamının taranmış dijital
+hali. Tipik boyut 40.000 × 60.000 piksel. Bir WSI tek başına birkaç yüz
+megabayttan birkaç gigabayta kadar olabilir.
+
+**Patch.** WSI'dan kesilen küçük kare. Modeller bir WSI'yı bütün olarak
+işleyemez; görüntü patch'lere bölünür. Bu çalışmada patch boyutu
+224 × 224 piksel, temsil ettiği fiziksel alan 112 × 112 mikrometredir.
+
+**MPP (microns per pixel).** Bir pikselin kaç mikrometreye karşılık
+geldiği. Tarayıcıya ve büyütmeye göre değişir. 0,25 µm/px kabaca 40×
+büyütme, 0,50 µm/px kabaca 20× demektir. İki slayt aynı piksel boyutunda
+olsa bile farklı MPP'ye sahipse farklı miktarda doku gösterir.
+
+**Stain deconvolution (boya ayrıştırma).** H&E boyamada iki boya vardır:
+hematoksilen (çekirdekleri mor-maviye boyar) ve eozin (sitoplazma ve
+stromayı pembeye boyar). Görüntüdeki her renk bu ikisinin karışımıdır.
+Deconvolution, görüntüyü optik yoğunluğa çevirerek her pikselin ne kadar
+hematoksilen ve ne kadar eozin içerdiğini hesaplar. Ruifrok ve Johnston
+(2001) tarafından tanımlanmıştır.
+
+**Foundation model (temel model).** Çok büyük miktarda etiketsiz veriyle,
+kendi kendine öğrenme (self-supervised learning) ile önceden eğitilmiş
+model. Belirli bir göreve göre değil, genel temsil öğrenmek için
+eğitilir. DINOv2 doğal görüntülerle, UNI ve Virchow patoloji
+görüntüleriyle eğitilmiştir.
+
+**Embedding (gömme vektörü).** Bir görüntünün model tarafından üretilen
+sayısal temsili. Bu çalışmada her patch 1024 sayıdan oluşan bir vektöre
+dönüştürülür. Bu vektör, görüntünün modelin "gördüğü" halidir.
+
+**Frozen backbone (donuk gövde).** Modelin ağırlıklarının eğitim sırasında
+değiştirilmemesi. Model yalnızca öznitelik çıkarıcı olarak kullanılır;
+gradyan hesaplanmaz, geri yayılım yapılmaz. Alternatifi olan
+fine-tuning'de model ağırlıkları göreve göre güncellenir ve bu çok daha
+pahalıdır.
+
+*Bu çalışmada neden donuk:* Tezin sorusu "hangi temel model daha iyi
+temsil üretiyor" olduğundan, modelleri değiştirmeden karşılaştırmak
+gerekir. Fine-tuning yapılırsa karşılaştırılan şey artık o modellerin
+hazır temsilleri olmaz. Ayrıca donuk kullanım, embedding'lerin bir kez
+hesaplanıp tüm sonraki deneylerde yeniden kullanılmasını sağlar: 10,5
+saatlik tek bir çıkarma işleminden sonra onlarca eğitim denemesi
+dakikalar sürer.
+
+**MIL (Multiple Instance Learning — çoklu örnek öğrenmesi).** Etiketin
+tek tek örneklere değil, örnek topluluğuna (bag) verildiği öğrenme
+biçimi. Burada bir slayt bir bag, her patch bir instance'tır. Patoloji
+raporu slaydın tamamına "LUAD" der; hangi patch'in tanıyı taşıdığı
+bilinmez. Model bunu kendisi bulmak zorundadır.
+
+**ABMIL (Attention-Based MIL).** Ilse ve arkadaşlarının (2018) önerdiği
+yöntem. Her instance'a bir dikkat ağırlığı atar, ağırlıklı ortalamayı
+alır ve bu temsilden karar verir. Dikkat ağırlıkları hangi patch'lerin
+karara katkı yaptığını gösterir; bu aynı zamanda açıklanabilirlik
+sağlar.
+
+**TSS (Tissue Source Site — doku kaynak merkezi).** Slaydı gönderen
+hastane. TCGA barkodunun ikinci alanında kodlanır:
+`TCGA-05-4244-01Z-00-DX1` barkodunda `05` merkez kodudur.
+
+**Batch effect (parti etkisi).** Veri toplayan kuruma özgü sistematik
+farklılıklar. Patolojide: boyama protokolü, boya markası, kesit
+kalınlığı, fiksasyon süresi, tarayıcı optiği, JPEG sıkıştırma ayarı.
+Bunlar görüntüde biyolojik olmayan ama ölçülebilir bir imza bırakır.
+
+**Confounding (karıştırıcı değişken).** İlgilenilen değişkenle istenmeyen
+bir değişkenin birlikte değişmesi. Bu çalışmada merkez ile sınıf birlikte
+değişmektedir: her merkez tek sınıf gönderdiği için "hangi merkez"
+sorusunun cevabı "hangi sınıf" sorusunun cevabını vermektedir.
+
+**Ablasyon (ablation study).** Sistemden bir bileşeni veya bir kaynağı
+çıkarıp performansın nasıl değiştiğini ölçen deney. Amaç, o bileşenin
+katkısını izole etmektir. Örnekler:
+
+- *Örnekleme yoğunluğu ablasyonu:* patch sayısını azaltıp performansın
+  hangi noktada doyuma ulaştığını ölçmek (bu çalışmada yapıldı)
+- *Renk ablasyonu:* görüntüyü gri tonlamaya çevirip rengin katkısını
+  ölçmek (planlanıyor)
+- *Normalizasyon ablasyonu:* Macenko uygulanmış ve uygulanmamış sürümleri
+  karşılaştırmak (planlanıyor)
+
+**Cross-validation (çapraz doğrulama).** Veriyi k parçaya bölüp her
+parçayı sırayla test kümesi olarak kullanmak. Tek bir bölünmenin şansına
+bağlı kalmamayı sağlar. Bu çalışmada k = 5.
+
+**Site-preserved cross-validation.** Bölmenin merkez seviyesinde
+yapılması: hiçbir merkez hem eğitimde hem testte bulunmaz. Howard ve
+arkadaşlarının (2021) önerdiği kontroldür.
+
+**Site prediction baseline (merkez tahmini taban çizgisi).** Aynı
+embedding'lerden sınıf yerine kaynak merkezi tahmin etme denemesi. Yüksek
+doğruluk, merkez bilgisinin embedding'lerde kodlandığını doğrudan
+gösterir. Bir çözüm değil, bir teşhis aracıdır.
+
+**Şans seviyesi (chance level).** Rastgele tahminin beklenen doğruluğu.
+İkili sınıflandırmada dengeli veride %50; 31 sınıflı bir problemde en sık
+sınıfın oranı. Bir doğruluk değeri şans seviyesiyle birlikte
+raporlanmadığında yorumlanamaz.
+
+**Normalize edilmiş kazanım (normalised lift).** Farklı zorluktaki
+görevleri karşılaştırmak için: (doğruluk − şans) / (1 − şans). 31 sınıflı
+bir problemde %73 ile 2 sınıflı bir problemde %86 doğrudan
+kıyaslanamaz; bu ölçek ikisini aynı eksene taşır.
+
+---
+
+# 2 · VERİ KÜMESİ VE KOHORT TANIMI
+
+Tanısal (FFPE — formalin fiksasyonlu, parafine gömülü) WSI'lar
+TCGA-LUAD ve TCGA-LUSC projelerinden Genomic Data Commons üzerinden
+indirilmiştir.
+
+Kohort üç kuralla tanımlanmıştır:
+
+| Kural | Gerekçe |
+|---|---|
+| Örnek tipi 01 (primer solid tümör) | Metastaz ve nüks dışarıda |
+| İlk tanısal slayt (DX1) | Aynı hastadan birden fazla slayt alınmaz |
+| Hasta başına tek WSI | Veri sızıntısı önlenir |
+
+## 2.1 · Dışlamalar
+
+**LUAD (480 tanısal kayıt → 466):**
+
+| n | Gerekçe |
+|---:|---|
+| 10 | Çözünürlük bilgisi yok; level-0 uzun kenarı tam 10.000 pikselde sabit — küçültülmüş türev görüntü |
+| 1 | İkincil tanısal slayt (DX10) |
+| 1 | Nüks tümör örneği |
+| 1 | Odak dışı; kalite kontrolünü geçen patch üretilemedi |
+| 1 | Trikrom boyama (H&E değil) |
+
+İlk gruptaki on slaydın hepsi tek bir merkezden gelmektedir; bu
+sistematik bir kayıp olarak raporlanmaktadır. Aynı merkezden gelen
+sağlam slaytların boyutu 37.120 ile 78.080 piksel arasında değişmektedir,
+dolayısıyla 10.000 piksellik tavan gerçek bir tarama değil, türetilmiş
+bir görüntüdür.
+
+**LUSC (512 tanısal slayt → 478):** dışlama gerekmemiştir. 34 ikincil
+tanısal slayt (DX2–DX9) indirme aşamasında filtrelenmiştir.
+
+## 2.2 · Nihai kohort
+
+| | WSI | Hasta | Patch | Merkez |
+|---|---:|---:|---:|---:|
+| LUAD | 466 | 466 | 900.828 | 33 |
+| LUSC | 478 | 478 | 934.875 | 35 |
+| **Toplam** | **944** | **944** | **1.835.703** | **68** |
+
+**Ortak merkez sayısı: 0.**
+
+Hiçbir kaynak merkez her iki sınıfa da slayt göndermemiştir. Bu bulgu
+`run.py sites` ile ölçülmüş ve çalışmanın en önemli metodolojik riski
+olarak kaydedilmiştir. Sonuçlarının tamamı Bölüm 10'da tartışılmaktadır.
+
+---
+
+# 3 · FİZİKSEL ÖLÇEK STANDARDİZASYONU
+
+## 3.1 · Problem
+
+Slayt üstverisinde bildirilen büyütme değeri güvenilir değildir. LUAD
+kohortunda 20× olarak etiketlenen 43 slayttan yalnızca 19'unun ölçülen
+çözünürlüğü 0,50 µm/px'tir; kalanı yaklaşık 0,2325 µm/px'tir.
+
+Piramit derinliği de değişmektedir (368 slaytta 4 seviye, 99'unda 3,
+1'inde 2). Bu nedenle sabit bir seviye indeksi kullanılamaz.
+
+## 3.2 · Çözüm
+
+Seviye seçimi bildirilen büyütmeye değil, **ölçülen MPP değerine** göre
+yapılmıştır. Her slayt için, etkin MPP'si 0,50 µm/px hedefine en yakın ve
+ondan kaba olmayan seviye seçilmiş, gereken bölge o seviyeden okunup
+yazılımla küçültülmüştür. Yukarı ölçekleme hiçbir koşulda yapılmamıştır.
+944 slaydın tamamı level 0'a çözümlenmiştir.
+
+Sonuç: patch'ler 224 × 224 piksel, temsil ettikleri fiziksel alan sabit
+112 × 112 µm. Okuma boyutları değişkendir (0,252 µm/px'te 444 px;
+0,2325 µm/px'te 482 px; 0,500 µm/px'te 224 px) ama temsil edilen doku
+alanı sabittir.
+
+**Neden önemli:** Standartlaştırılmasaydı, aynı 224 pikselli patch bazı
+slaytlarda 56 µm, bazılarında 112 µm doku gösterecekti. Model farklı
+ölçeklerde yapı görüp aynı etiketi öğrenmeye çalışacaktı.
+
+---
+
+# 4 · PATCH ÇIKARMA VE KALİTE KONTROLÜ
+
+## 4.1 · Tarama aşaması
+
+Aday koordinatlar örtüşmesiz bir ızgara üzerinde (adım 112 µm), **tavan
+ve eşik uygulanmadan** sayılmıştır. Böylece her parametrenin etkisi
+varsayılmak yerine ölçülebilmiştir.
+
+## 4.2 · Uygulanan eşikler
+
+| Eşik | Değer | Ne eler |
+|---|---|---|
+| Doku oranı | ≥ 0,80 | Boş cam, kenar bölgeler |
+| Mürekkep oranı | ≤ 0,01 | Kalem izi |
+| Laplacian varyansı | ≥ 100 | Bulanık, odak dışı bölgeler |
+| Negatif konsantrasyon oranı | ≤ 0,15 | H&E ile açıklanamayan renkler |
+
+**Bulanıklık neden yeniden boyutlandırmadan sonra ölçüldü:** Laplacian
+varyansı çözünürlüğe bağlıdır. Farklı native MPP'ye sahip slaytlar farklı
+piksel boyutlarında okunduğundan, eşik küçültmeden önce uygulansaydı
+native 20× slaytlar sistematik olarak cezalandırılacaktı.
+
+Slayt başına en fazla 2.000 patch, aday havuzundan deterministik bir
+hash ile (blake2b, tohum 42) örneklenmiştir. Deterministik olması
+tekrarlanabilirlik sağlar: aynı tohumla aynı patch'ler seçilir ve
+manifest'in ilk N satırı her zaman aynıdır.
+
+---
+
+# 5 · MÜREKKEP TESPİTİ
+
+## 5.1 · Renk tabanlı yöntemler neden başarısız oldu
+
+| Denenen | Neden işe yaramadı |
+|---|---|
+| RGB mavi kanal oranı | Hematoksilen de mavi baskın; en bilgi yoğun çekirdekli bölgeleri siliyor |
+| HSV ton aralığı | Boyama yoğunluğu merkeze göre kayıyor; sabit sınır her hastanede farklı yere düşüyor |
+
+İkisi de **renge** bakıyordu. Deconvolution ise **boya kimyasına** bakar:
+"bu rengi H&E ile üretebilir miyim?" Çekirdek ne kadar koyu olursa olsun
+cevap evettir, çünkü rengi hematoksilenden gelmektedir.
+
+## 5.2 · İki ölçütlü birleşim maskesi
+
+```python
+pen = (residual > 0.45) | (negatif_konsantrasyon < -0.05)
+```
+
+| Ölçüt | Yakaladığı | Fiziksel gerekçe |
+|---|---|---|
+| Kalıntı (residual) | Kırmızı, magenta | Eozin yönüne yakın; temsil edilebiliyor ama kalıntı bırakıyor |
+| Negatif konsantrasyon | Yeşil, mavi, turkuaz | H&E düzleminin ters yönü; ancak negatif katsayıyla temsil edilebiliyor |
+
+İkinci ölçüt fiziksel bir argümana dayanır: **boya konsantrasyonu negatif
+olamaz.** Negatif katsayı, rengin H&E düzleminin dışında olduğunu
+gösterir. Turkuaz bir patch'te eozin katsayısı −0,596 ölçülmüştür.
+
+Yoğun kalemli bir slaytta doku içinde yakalama oranları: kalıntı ölçütü
+%37,5; negatif konsantrasyon ölçütü %28,6; birleşim %66,0.
+
+## 5.3 · Neden tüm kohorta uygulanmadı
+
+Birleşim maskesi kalemsiz slaytlarda normal dokuyu da elemektedir
+(`TCGA-05-4433`: doku oranı %19,7 → %8,0). Bu nedenle yalnızca bulanıklık
+filtresinin 1.000'den fazla aday elediği **18 slayda** uygulanmıştır
+(LUAD 15, LUSC 3). Seçim kriteri ölçüme dayalıdır, keyfi değildir.
+
+## 5.4 · Kalem kullanımı merkeze özgüdür
+
+LUSC'ta en yoğun kalemli 12 slaydın 11'i tek bir merkezden gelmektedir
+(ortalama mürekkep oranı %7,19; ikinci sıradaki merkez %0,59). Aynı kalıp
+LUAD'da bağımsız olarak farklı bir merkezde gözlenmiştir (%11,58 ve
+%1,65).
+
+Bu, batch effect'in somut bir örneğidir: kalem kullanımı bir hastane
+rutinidir ve görüntüde iz bırakır.
+
+## 5.5 · Antrakoz filtrelenmemiştir
+
+Akciğerdeki siyah karbon birikimi gerçek biyolojik yapıdır. Miktarı
+hastanın yaşadığı yere ve sigara geçmişine, dolayısıyla kaynak merkeze
+bağlıdır. Elenmesi merkeze bağımlı bir seçilim yaratacağından
+filtrelenmemiştir. Negatif konsantrasyon eşiği bu nedenle 0,05'ten 0,15'e
+çekilmiştir.
+
+---
+
+# 6 · ÖZNİTELİK ÇIKARMA
+
+Patch embedding'leri **DINOv2 ViT-L/14** ile, ağırlıklar donuk tutularak
+çıkarılmıştır. CLS token (1.024 boyut) alınmış, slayt başına bir dizi
+yarı hassasiyetle (fp16) saklanmıştır.
+
+Boya normalizasyonu ve renk augmentation uygulanmamıştır — minimal ön
+işleme protokolü izlenmiştir.
+
+**Niçin minimal:** Temel modeller çok merkezli devasa veriyle
+eğitilmiştir; renk çeşitliliği eğitim dağılımlarının içindedir.
+Normalizasyon onları o dağılımın dışına çıkarabilir. Ayrıca normalizasyon
+etkisinin ölçülebilmesi için normalize edilmemiş bir taban çizgisi
+gereklidir.
+
+## 6.1 · İşlem süresi
+
+| Aşama | Süre |
+|---|---|
+| LUAD embedding (466 WSI, 900.828 patch) | 5,3 saat |
+| LUSC embedding (478 WSI, 934.875 patch) | 5,2 saat |
+| **Toplam** | **10,5 saat** |
+
+Donanım: NVIDIA RTX 3050 Ti Laptop, 4 GB VRAM. Ölçülen hız ~48–57
+patch/saniye.
+
+Çıktı: slayt başına bir `.npy` dosyası, `(n_patch, 1024)` boyutunda,
+fp16. Toplam 3,8 GB.
+
+Her `.npy` yanında bir `.json` dosyası, hangi satırın hangi patch'e
+karşılık geldiğini saklar. Bu sayede alt küme ablasyonu embedding yeniden
+çıkarmadan yapılabilir.
+
+## 6.2 · Pilot koşu
+
+Boru hattı önce slayt başına 100 patch ile (94.378 patch, 33 dakika)
+doğrulanmıştır. Amaç sonuç almak değil, embedding boyutlarının,
+bag kurulumunun, bölmenin ve eğitimin uçtan uca çalıştığını görmekti.
+
+Bu aşamada iki kurulum sorunu tespit edilmiştir:
+
+- **NumPy sürüm çakışması:** PyTorch NumPy 1.x'e göre derlenmiş, ortamda
+  2.2.6 vardı. `numpy<2` ile çözüldü.
+- **WSL'de libcuda bulunamıyor:** CUDA sürücü kütüphaneleri
+  `/usr/lib/wsl/lib` altındadır ve varsayılan arama yolunda değildir.
+  `LD_LIBRARY_PATH` ile çözüldü.
+
+Bu sorunlar 9 saatlik tam koşu yerine 33 dakikalık pilotta ortaya
+çıkmıştır.
+
+---
+
+# 7 · SLAYT SEVİYESİ SINIFLANDIRMA
+
+Slayt etiketleri **ABMIL** (gated attention) ile tahmin edilmiştir.
+
+## 7.1 · Mimari
+
+| Katman | Boyut |
+|---|---|
+| Projeksiyon | 1024 → 512, ReLU, dropout 0,25 |
+| Dikkat (gated) | 512 → 384, tanh ve sigmoid kolları |
+| Dikkat ağırlığı | 384 → 1, softmax |
+| Çıkış | 512 → 1 |
+
+Toplam yaklaşık 900.000 parametre. DINOv2'nin ~300 milyon parametresinin
+yanında 330 kat küçüktür — eğitim bu yüzden dakikalar sürer.
+
+## 7.2 · Eğitim ayarları
+
+| Parametre | Değer |
+|---|---|
+| Optimizer | AdamW |
+| Öğrenme oranı | 2 × 10⁻⁴ |
+| Ağırlık azalması | 10⁻⁵ |
+| Gradyan biriktirme | 8 bag |
+| En fazla epoch | 30 |
+| Erken durdurma | doğrulama AUC üzerinden, sabır 7 |
+
+Gradyan biriktirme kullanılmasının nedeni bag'lerin değişken boyutlu
+olmasıdır: her slayt farklı sayıda patch içerir, bu yüzden klasik batch
+oluşturulamaz. Sekiz bag'in gradyanı toplanıp tek adım atılır.
+
+---
+
+# 8 · DEĞERLENDİRME TASARIMI
+
+## 8.1 · İki bölme şeması
+
+**Hasta-katmanlı (patient-stratified).** Fold'lar hasta seviyesinde,
+sınıf dengesi korunarak oluşturulur. Literatürde en yaygın raporlanan
+yapılandırmadır. Aynı hasta hem eğitimde hem testte bulunamaz, ancak
+aynı **merkez** her iki tarafta da bulunabilir.
+
+**Merkez-korumalı (site-preserved).** Fold'lar kaynak merkez seviyesinde
+atanır; hiçbir merkez hem eğitimde hem testte bulunmaz.
+
+Merkezler tek sınıflı olduğundan klasik leave-one-site-out uygulanamaz.
+Bunun yerine merkezler her sınıf içinde açgözlü bir algoritmayla
+fold'lara dağıtılmış, her fold'da her iki sınıfın temsil edilmesi
+sağlanmıştır. Sonuçta her fold 10–16 merkez içermekte ve sınıf dengesi
+korunmaktadır.
+
+## 8.2 · İç doğrulama kümesi — düzeltilen bir hata
+
+Erken durdurma için eğitim kümesinden bir iç doğrulama kümesi
+ayrılmaktadır (%15).
+
+İlk uygulamada bu ayırma her iki şemada da hasta seviyesinde yapılıyordu.
+Bu, merkez-korumalı şemada bir sorun yaratmıştır: iç doğrulama kümesi
+eğitim merkezlerinden geliyordu, dolayısıyla erken durdurma *"tanıdık
+merkezlerde iyi ol"* kriterine göre seçim yapıyordu. Merkez kestirmesini
+en iyi kullanan model bu kriterde en yüksek skoru alıyor ve yabancı
+merkezlerde test ediliyordu.
+
+Ölçüm bunu göstermişti: doğrulama AUC 0,96, test AUC 0,83.
+
+**Düzeltme:** İç doğrulama kümesi dış bölmeyle aynı seviyede ayrılır —
+hasta-katmanlı şemada hasta seviyesinde, merkez-korumalı şemada merkez
+seviyesinde. Böylece erken durdurma, merkezler arası genellemeye göre
+seçim yapar.
+
+Bu düzeltme olmadan merkez-korumalı sonuç, *"düşük skor merkez
+etkisinden değil, hatalı model seçiminden kaynaklanıyor olabilir"*
+itirazına açık kalırdı.
+
+---
+
+# 9 · BULGULAR
+
+## 9.1 · Tablo 1 — İki bölme şemasının karşılaştırması
+
+DINOv2, 2.000 patch/WSI, 5 fold, ortalama ± standart sapma:
+
+| Şema | AUC | Doğruluk | Dengeli doğruluk | F1 |
+|---|---|---|---|---|
+| Hasta-katmanlı | 0,942 ± 0,013 | 0,840 ± 0,036 | 0,839 ± 0,037 | 0,855 ± 0,027 |
+| Merkez-korumalı | 0,901 ± 0,025 | 0,798 ± 0,049 | 0,796 ± 0,051 | 0,822 ± 0,035 |
+
+Merkezlerin eğitimden tamamen çıkarılması AUC'yi 0,041, doğruluğu 4,3
+puan düşürmüştür. Fold'lar arası doğruluk sapması 0,036'dan 0,049'a
+çıkmıştır: merkez-korumalı şemada performans, hangi merkezlerin dışarıda
+bırakıldığına bağlı hale gelmektedir.
+
+### Doğrulama–test açığı
+
+Merkez-korumalı şemada iç doğrulama AUC'si test AUC'sini aşmaktadır
+(0,922–0,978'e karşı 0,856–0,936). Doğrulama merkezleri de eğitimde
+görülmediğinden bu açık merkez sızıntısından kaynaklanmamaktadır.
+
+İki nedeni vardır:
+
+1. **Epoch üzerinden seçim yanlılığı.** 30 epoch'un en yüksek doğrulama
+   AUC'si seçilmektedir; yaklaşık 110 slaytlık bir bölümde 30 denemenin
+   maksimumu yukarı yönlü yanlıdır.
+2. **Merkezler arası varyans.** Doğrulama merkezleri ile test merkezleri
+   farklı zorlukta olabilir.
+
+## 9.2 · Tablo 2 — Örnekleme yoğunluğu ablasyonu
+
+Aynı embedding'ler her slaydın dizisinin ilk N satırına kesilmiştir.
+Manifest çıkarma aşamasının deterministik örnekleme sırasını koruduğundan,
+herhangi bir alt kümenin ilk N satırı her zaman aynıdır: patch sayısı
+**tek değişken** olarak değişir, örnekleme rastgeleliği karışmaz.
+
+| Patch/WSI | Doku kapsamı | Hasta-katmanlı | Merkez-korumalı | Fark |
+|---|---|---|---|---|
+| 10 | %0,09 | 0,882 | 0,789 | 0,092 |
+| 50 | %0,45 | 0,917 | 0,859 | 0,057 |
+| 100 | %0,90 | 0,920 | 0,850 | 0,070 |
+| 500 | %4,5 | 0,939 | 0,863 | 0,076 |
+| 1.000 | %9,1 | 0,942 | 0,889 | 0,053 |
+| 2.000 | %18 | 0,942 | 0,901 | 0,041 |
+
+### Bulgu A — hasta-katmanlı şema 1.000'de doyuyor
+
+1.000'den 2.000'e kazanç **0,0003 AUC**. Eğri düzleşmiştir.
+
+Donanım kısıtından seçilen 2.000 patch tavanı, bu değerlendirme için
+azalan verim noktasının üzerindedir. Bu artık ölçülmüş bir gerekçedir,
+keyfi bir karar değil.
+
+### Bulgu B — merkez-korumalı şema doymuyor
+
+500 → 1.000: +0,026 AUC. 1.000 → 2.000: +0,013 AUC. Eğri hâlâ
+yükselmektedir.
+
+**Yorum:** Görülmemiş merkezlere genelleme, eğitimde zaten temsil edilen
+merkezler içinde genellemeden **daha yüksek örnekleme yoğunluğu**
+gerektirmektedir.
+
+Olası mekanizma: tanıdık merkezlerde kestirme yol (boyama ve tarayıcı
+imzası) mevcut olduğundan seyrek örnekleme yeterli performans
+sağlamaktadır. Yabancı merkezlerde o kestirme aktarılmadığından model
+morfolojik kanıta ihtiyaç duymakta, bu kanıt ise daha yavaş birikmektedir.
+
+Bu asimetri, incelenen literatürde raporlanmamıştır.
+
+### Bulgu C — fark daralıyor (temkinli)
+
+Fark 0,092'den 0,041'e inmiştir ancak **monoton değildir** (100 ve
+500'de yükselmektedir) ve tek tek farklar fold standart sapmasıyla
+(0,013–0,025) aynı mertebededir. Doğruluk farkı ise belirgin bir eğilim
+göstermemektedir.
+
+Bu eğri tek tohumla ölçülmüştür ve bir eğilim olarak raporlanmaktadır,
+kesinleşmiş bir bulgu olarak değil.
+
+## 9.3 · Tablo 3 — Merkez bazında hata oranları
+
+En büyük 12 merkez:
+
+| TSS | Sınıf | n | Hasta-katmanlı | Merkez-korumalı |
+|---|---|---|---|---|
+| 55 | LUAD | 91 | %26 | %13 |
+| 85 | LUSC | 50 | %12 | %22 |
+| 44 | LUAD | 46 | %41 | %24 |
+| 77 | LUSC | 44 | %7 | %11 |
+| 56 | LUSC | 41 | %7 | %2 |
+| 66 | LUSC | 38 | %0 | %0 |
+| 22 | LUSC | 37 | %14 | %0 |
+| 86 | LUAD | 34 | %24 | **%50** |
+| 78 | LUAD | 31 | %13 | **%35** |
+| 49 | LUAD | 28 | %25 | %29 |
+| 60 | LUSC | 25 | %0 | %0 |
+| 63 | LUSC | 24 | %0 | %0 |
+
+### TSS 66 — en güçlü tek kanıt
+
+Pilot aşamada (100 patch/slayt) bu merkez şu davranışı göstermişti:
+
+| 100 patch | Hata |
+|---|---:|
+| Merkez eğitimde | %5 |
+| Merkez dışarıda | **%58** |
+
+İkili sınıflandırmada şans seviyesi %50'dir. %58 hata şanstan kötüdür —
+model 38 slaydın tamamını sistematik olarak **ters sınıfa** atamıştır.
+Bu gürültü değil, yön hatasıdır: model o merkezin morfolojisini
+öğrenmemiş, *"bu merkezin görünümü = LUSC"* kuralını ezberlemişti.
+
+Tam örnekleme yoğunluğunda (2.000 patch) bu merkez **her iki şemada da
+hatasız** sınıflandırılmaktadır. 22 ve 56 numaralı merkezler de
+merkez-korumalı şemada hasta-katmanlı şemadan daha düşük hata
+göstermektedir.
+
+### Ters yönde iki merkez
+
+TSS 86 (%24 → %50) ve TSS 78 (%13 → %35) dışarıda bırakıldıklarında
+belirgin biçimde kötüleşmektedir.
+
+TSS 86, ön işleme sırasında sistematik kalem kullanımı tespit edilen LUAD
+merkezidir; on slaydında birleşim mürekkep maskesi uygulanmıştır.
+Mürekkep temizlendikten sonra bile o merkeze özgü edinim farklarının
+sürdüğü düşünülebilir.
+
+**Etki merkezden merkeze aynı değildir.**
+
+## 9.4 · Tablo 4 — Merkez tahmini taban çizgisi
+
+Aynı embedding'lerden hem merkez hem sınıf tahmini; 31 merkez (≥ 10
+slayt), hasta-gruplu çapraz doğrulama:
+
+| Hedef | Seviye | Şans | 100 patch | 2.000 patch |
+|---|---|---|---|---|
+| Kaynak merkez | slayt (ortalama) | 0,114 | 0,732 | **0,741** |
+| Sınıf | slayt (ortalama) | 0,506 | 0,861 | 0,857 |
+| Kaynak merkez | patch | 0,114 | 0,521 | **0,525** |
+| Sınıf | patch | 0,506 | 0,701 | 0,702 |
+
+Kaynak merkez, ortalama havuzlanmış slayt embedding'lerinden 31 aday
+arasından **%74,1** doğrulukla tanınmaktadır.
+
+Normalize edilmiş kazanım cinsinden:
+
+| Hedef | Seviye | Kazanım |
+|---|---|---|
+| Merkez | slayt | 0,71 |
+| Sınıf | slayt | 0,71 |
+| Merkez | patch | **0,46** |
+| Sınıf | patch | 0,40 |
+
+Slayt seviyesinde merkez bilgisi sınıf bilgisiyle **aynı ölçüde
+erişilebilirdir**. Patch seviyesinde ise merkez bilgisi sınıf bilgisini
+**geçmektedir**: tek bir 112 × 112 µm'lik alan, tümör alt tipini
+tahmin ettiğinden daha iyi biçimde gönderen kurumu tahmin etmektedir.
+
+### Örnekleme yoğunluğundan bağımsızlık
+
+Dört değer de yirmi kat örnekleme artışına rağmen değişmemiştir.
+
+| | 100 → 2.000 patch |
+|---|---|
+| Merkez tahmini (ortalama havuzlama) | 0,732 → 0,741 (sabit) |
+| ABMIL, merkez-korumalı AUC | 0,868 → 0,901 (arttı) |
+
+**Yorum:** Kurumsal imza esasen her patch'te mevcuttur, bu nedenle daha
+fazla doku üzerinden ortalama almak onu seyreltmez. Buna karşılık dikkat
+tabanlı model aynı aralıkta belirgin biçimde iyileşmiştir.
+
+Aradaki fark **dikkat mekanizmasıdır**: ortalama havuzlama ayırt edici
+patch'leri sıradan olanlarla karıştırır; dikkat onları seçebilir. Daha
+fazla patch, dikkate seçecek daha fazla malzeme verir.
+
+Örnekleme yoğunluğunu artırmak öznitelik uzayındaki merkez imzasını
+zayıflatmamakta, modelin morfolojik sinyale erişimini artırmaktadır.
+
+## 9.5 · Renk kontrolü
+
+Yalnızca renk istatistiklerinden (slayt başına RGB kanal ortalaması ve
+standart sapması — altı öznitelik) sınıf tahmini:
+
+| Çapraz doğrulama | Doğruluk |
+|---|---|
+| Merkez karışık | 0,573 |
+| Merkez ayrılmış | **0,412** |
+| (şans) | 0,506 |
+
+Merkezler ayrıldığında doğruluk **şans seviyesinin altına** düşmektedir.
+Eğitim merkezlerinden öğrenilen renk kuralı yeni merkezlere **ters**
+aktarılmaktadır.
+
+Yani kaba renk istatistikleri sınıf değil **merkez** bilgisi
+taşımaktadır. Temel modelin kullandığı sinyal, küresel renk
+istatistiklerinden daha zengindir.
+
+---
+
+# 10 · TARTIŞMA
+
+## 10.1 · Konfoundun yapısı
+
+Hiçbir kaynak merkez her iki sınıfa da katkı vermemektedir. Eğitim
+dağılımı içinde *"bu slayt s merkezinden gelmektedir"* önermesi ile
+*"bu slayt c sınıfındandır"* önermesi **özdeş bilgi** taşımaktadır.
+Birini bastıran her işlem diğerini de bastırır.
+
+### Analoji
+
+Bütün kedi fotoğrafları evde (halı zemin), bütün köpek fotoğrafları
+parkta (çimen zemin) çekilmiş olsun. Model "halı varsa kedi, çimen varsa
+köpek" kuralını öğrenir. Bu kural eğitim verisinde %100 doğrudur, model
+hiç ceza almaz, hayvana bakmayı hiç öğrenmez.
+
+Modeli hayvana bakmaya zorlamak için **evde çekilmiş bir köpek
+fotoğrafı** gerekir. Bu veri kümesinde öyle bir örnek yoktur.
+
+### Neden domain-adversarial eğitim uygulanamaz
+
+Gradyan tersine çevirme ile alan bilgisinin bastırılması, hastane kaynağı
+AUC'sini 0,96'dan 0,51'e düşürürken hastalık sınıflandırma performansını
+koruyabilmektedir. Ancak bu sonuç, kurumların **birden fazla sınıfa**
+katkı verdiği kohortlarda elde edilmiştir; orada iki büyüklük
+ayrıştırılabilir.
+
+Burada ayrıştırılamaz. Adversarial kayıp sınıflandırma kaybıyla doğrudan
+çelişir.
+
+### Merkez-korumalı bölme ne yapar, ne yapmaz
+
+İmzayı **silmez**. Modelin değerlendirme sırasında imzayı kullanmaktan
+ödül almasını engeller. Raporlanan değeri, görülmemiş bir kurumdaki
+davranışın dürüst bir tahmini haline getirir — fazlası değil.
+
+## 10.2 · Bu sonuçlar neyi kanıtlıyor
+
+Merkez-korumalı performans örnekleme yoğunluğuyla artmıştır (100 → 2.000
+patch: 0,868 → 0,901 AUC). Bu artış, modelin **hiçbir slaydını görmediği**
+merkezler üzerinde gerçekleşmiştir.
+
+TSS 66, şanstan kötü hata oranından hatasız sınıflandırmaya geçmiştir —
+aynı koşulda, merkez eğitimde yokken.
+
+Dolayısıyla model **kurumlar arası aktarılabilen bir temsil**
+edinmektedir ve daha fazla doku örneklendikçe bundan daha fazlasını
+edinmektedir.
+
+## 10.3 · Bu sonuçlar neyi kanıtlamıyor
+
+Aktarılabilen sinyalin **morfoloji olduğu** mevcut kanıtlarla
+söylenemez.
+
+Birçok kurumda ortak olan bir boyama veya edinim karakteristiği de
+kısmen aktarılır ve morfoloji değildir. Bu iki olasılık mevcut
+ölçümlerle ayrıştırılamamaktadır.
+
+Ayrıca:
+
+- Tam yoğunlukta kalan 0,041 AUC farkı açıklanmamıştır
+- İki merkez (86 ve 78) merkez-korumalı şemada iyileşmek yerine
+  kötüleşmektedir
+- Kaynak merkez embedding'lerden %74,1 doğrulukla tanınmaya devam
+  etmektedir ve bu değer örnekleme yoğunluğundan bağımsızdır
+
+**Kurumsal imza bu boru hattının hiçbir adımında kaldırılmamıştır;
+yalnızca değerlendirmede daha az sömürülebilir hale getirilmiştir.**
+
+---
+
+# 11 · SONRAKİ ADIMLAR
+
+| # | Deney | Maliyet | Ne cevaplar |
+|---|---|---|---|
+| 1 | Dikkat görselleştirme | Birkaç saat, GPU yok | En yüksek ağırlıklı patch'ler morfolojik yapı mı gösteriyor |
+| 2 | Gri tonlama ablasyonu | Bir embedding geçişi (~10 sa) | Aktarılan sinyal renk mi değil mi |
+| 3 | UNI ve Virchow | Her biri ~10 sa | Tezin ana karşılaştırması |
+| 4 | Tekrarlı tohum | 2–3 sa | Fark daralması eğilimi tekrarlanabilir mi |
+| 5 | Macenko ablasyonu | ~10 sa + çıkarma | Renk normalizasyonunun katkısı |
+| 6 | Harici kohort (CPTAC-3) | Yüksek (indirme + disk) | Konfoundu tamamen baypas eder |
+
+## 11.1 · Gri tonlama ablasyonu — mantığı
+
+Patch'ler gri tonlamaya çevrilip embedding yeniden çıkarılır ve aynı
+deneyler tekrarlanır.
+
+| Sonuç | Yorum |
+|---|---|
+| Merkez-korumalı performans korunur | Öğrenilen şey renk değil — **morfoloji yorumu güçlenir** |
+| Performans çöker | Renge yaslanılıyormuş |
+
+**Uyarı:** Temel modeller H&E renginde eğitilmiştir; gri görüntü onlar
+için dağılım dışıdır. Bu nedenle tek bir sayıya değil, **iki düşüşün
+karşılaştırmasına** bakılmalıdır: sınıf doğruluğundaki düşüş ile merkez
+tahminindeki düşüş. İkincisi belirgin biçimde büyükse renk ağırlıklı
+olarak merkez bilgisi taşıyordu demektir.
+
+## 11.2 · UNI ve Virchow
+
+HuggingFace erişimi onaylanmıştır. Aynı protokolle değerlendirilecektir.
+
+Literatür, daha güçlü kodlayıcıların daha güçlü kurumsal imza
+taşıdığını raporlamaktadır. Tablo 4 bu iddianın bu kohortta test
+edilebileceği taban çizgisini sağlamaktadır.
+
+**Tezin ana sorusuyla doğrudan bağlantı:** UNI veya Virchow DINOv2'yi
+geçerse, bu kazancın ne kadarı patolojiye özgü ön eğitim, ne kadarı daha
+keskin merkez ayrımıdır? Merkez tahmini taban çizgisi olmadan bu soru
+cevaplanamaz.
+
+## 11.3 · Harici kohort
+
+CPTAC-3 akciğer vakaları her iki histolojik tipi tek protokol altında
+içermektedir (230 adenokarsinom, 109 skuamöz hücreli). TCGA'dan farklı
+olarak iki sınıf ayrı projeler halinde toplanmamıştır.
+
+GDC bu proje için `tissue_source_site` alanını döndürmemektedir;
+dolayısıyla kohortun kurumsal yapısı yalnızca üstveriden önceden
+doğrulanamamaktadır.
+
+İki kullanım mümkündür:
+
+- **Harici test olarak:** merkez yapısını bilmek gerekmez. TCGA'da eğit,
+  CPTAC'ta test et.
+- **Eğitime eklemek:** konfoundu kırar, ancak CPTAC'ın merkez yapısının
+  karışık sınıflı olması gerekir.
+
+---
+
+## KAYNAKLAR
+
+Ruifrok AC, Johnston DA. Quantification of histochemical staining by
+color deconvolution. *Anal Quant Cytol Histol* 2001;23(4):291–299.
+
+Ilse M, Tomczak JM, Welling M. Attention-based deep multiple instance
+learning. *ICML* 2018.
+
+Howard FM, Dolezal J, Kochanny S, et al. The impact of site-specific
+digital histology signatures on deep learning model accuracy and bias.
+*Nature Communications* 2021;12:4423.
+https://doi.org/10.1038/s41467-021-24698-1
+
+Do Histopathological Foundation Models Eliminate Batch Effects?
+A Comparative Study. arXiv:2411.05489
+
+Hospital-Specific Bias in Patch-Based Pathology Models. arXiv:2508.14779
+
+Dawood M, et al. Do Tissue Source Sites Leave Identifiable Signatures in
+Whole Slide Images Beyond Staining? *ICLR Workshop* 2023.
+
+Tellez D, et al. Quantifying the effects of data augmentation and stain
+color normalization in convolutional neural networks for computational
+pathology. arXiv:1902.06543
+
+Lu MY, Williamson DFK, Chen TY, et al. Data-efficient and weakly
+supervised computational pathology on whole-slide images (CLAM).
+*Nature Biomedical Engineering* 2021;5:555–570.
