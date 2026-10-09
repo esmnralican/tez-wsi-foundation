@@ -130,7 +130,7 @@ def ic_dogrulama_ayir(kalan, mod, oran, rng):
     return tren, val
 
 
-def degerlendir(model, torbalar, device):
+def degerlendir(model, torbalar, device, esik=0.5):
     model.eval()
     skor, gercek = [], []
     with torch.inference_mode():
@@ -139,7 +139,7 @@ def degerlendir(model, torbalar, device):
             skor.append(torch.sigmoid(logit).item())
             gercek.append(b["y"])
     skor, gercek = np.array(skor), np.array(gercek)
-    tahmin = (skor >= 0.5).astype(int)
+    tahmin = (skor >= esik).astype(int)
     return {
         "auc": roc_auc_score(gercek, skor) if len(set(gercek)) > 1 else float("nan"),
         "acc": accuracy_score(gercek, tahmin),
@@ -147,6 +147,20 @@ def degerlendir(model, torbalar, device):
         "f1": f1_score(gercek, tahmin, zero_division=0),
     }, skor
 
+
+def esik_sec(model, val, device):
+    """
+    Ic dogrulama kumesinde tahmin edilen pozitif orani, gercek pozitif
+    oranina esitleyen esigi secer. Youden J'ye gore kucuk kumelerde
+    cok daha kararlidir.
+    """
+    _, skor = degerlendir(model, val, device)
+    y = np.array([b["y"] for b in val])
+    if len(set(y)) < 2:
+        return 0.5
+    oran = y.mean()                       # gercek pozitif oran
+    esik = float(np.quantile(skor, 1 - oran))
+    return float(np.clip(esik, 0.05, 0.95))
 
 def egit(tren, val, device, epoch, lr, wd, accum, sabir, tohum, sessiz):
     torch.manual_seed(tohum)
@@ -253,15 +267,16 @@ def main():
         model, en_iyi = egit(tren, val, device, a.epoch, a.lr, a.wd,
                              a.accum, a.sabir, a.seed + f, a.sessiz)
 
-        m, skor = degerlendir(model, test, device)
-        m["fold"], m["val_auc"] = f, en_iyi
+        esik = esik_sec(model, val, device)
+        m, skor = degerlendir(model, test, device, esik)
+        m["fold"], m["val_auc"], m["esik"] = f, en_iyi, round(esik, 3)
         metrikler.append(m)
         for b, s in zip(test, skor):
             tahminler.append({"fold": f, "wsi_id": b["wsi_id"],
                               "patient": b["patient"], "tss": b["tss"],
                               "gercek": b["label"],
                               "skor_LUSC": round(float(s), 4),
-                              "tahmin": "LUSC" if s >= 0.5 else "LUAD"})
+                              "tahmin": "LUSC" if s >= esik else "LUAD"})
         print(f"      TEST  auc {m['auc']:.4f}  acc {m['acc']:.4f}  "
               f"bal_acc {m['bal_acc']:.4f}  f1 {m['f1']:.4f}\n")
 
@@ -283,7 +298,7 @@ def main():
 
     with open(out / "fold_metrics.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=["fold", "auc", "acc", "bal_acc",
-                                           "f1", "val_auc"])
+                                           "f1", "val_auc", "esik"])
         w.writeheader(); w.writerows(metrikler)
     with open(out / "predictions.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(tahminler[0].keys()))

@@ -50,15 +50,14 @@ MODELLER = {
 class PatchSeti(Dataset):
     """Bir slaydin patch'leri. Sira manifest sirasidir."""
 
-    def __init__(self, yollar):
+    def __init__(self, yollar, gri=False):
         self.yollar = yollar
         import torchvision.transforms as T
-        self.tf = T.Compose([
-            T.Resize((224, 224)),          # zaten 224, guvenlik icin
-            T.ToTensor(),
-            T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
-
+        adimlar = [T.Resize((224, 224))]
+        if gri:
+            adimlar.append(T.Grayscale(num_output_channels=3))
+        adimlar += [T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)]
+        self.tf = T.Compose(adimlar)
     def __len__(self):
         return len(self.yollar)
 
@@ -144,14 +143,15 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--fp32", action="store_true", help="fp16 yerine fp32")
-    ap.add_argument("--yeniden", action="store_true",
+    ap.add_argument("--yeniden", action="store_true", 
                     help="var olan .npy dosyalarini da yeniden hesapla")
+    ap.add_argument("--gri", action="store_true",
+                    help="patch'leri gri tonlamaya cevirir (renk ablasyonu)")
     a = ap.parse_args()
 
     out_dir = Path(a.out) if a.out else ROOT / "out" / a.label
-    emb_dir = out_dir / "embeddings" / a.model
-    if a.limit:
-        emb_dir = out_dir / "embeddings" / f"{a.model}_n{a.limit}"
+    ad = a.model + ("_gri" if a.gri else "")
+    emb_dir = out_dir / "embeddings" / (f"{ad}_n{a.limit}" if a.limit else ad)
     emb_dir.mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -199,7 +199,7 @@ def main():
             continue
 
         t0 = time.time()
-        dl = DataLoader(PatchSeti(yollar), batch_size=a.batch, shuffle=False,
+        dl = DataLoader(PatchSeti(yollar, a.gri), batch_size=a.batch, shuffle=False,
                         num_workers=a.workers, pin_memory=(device == "cuda"))
 
         parcalar = []
