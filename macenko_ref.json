@@ -1,0 +1,11 @@
+{
+  "referans_dosya": "macenko_ref.png",
+  "kaynak_kohort": "LUSC",
+  "wsi_id": "TCGA-94-A5I4-01Z-00-DX1",
+  "patch_file": "TCGA-94-A5I4-01Z-00-DX1_x102752_y45448.jpg",
+  "kontrast_std": 62.76,
+  "arka_plan_orani": 0.0467,
+  "kan_orani": 0.0,
+  "secim_tohumu": 42,
+  "secim_indeksi": 4
+}
