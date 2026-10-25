@@ -30,7 +30,7 @@ N_TEST = 189      # fold basina ortalama test slaydi
 N_TRAIN = 755     # fold basina egitim + ic dogrulama
 
 
-def kosullari_oku(mod, abl=None):
+def kosullari_oku(mod, abl=None, secili=None):
     """
     {kosul: {(tohum, fold): auc}}
 
@@ -46,7 +46,10 @@ def kosullari_oku(mod, abl=None):
         if not m:
             continue
         kosul = m.group(1)
-        if abl:
+        if secili is not None:
+            if kosul not in secili:
+                continue
+        elif abl:
             if not (kosul.startswith("abl_n") or kosul == abl):
                 continue
         elif kosul.startswith(("abl_", "renk_")) or "_n100" in kosul or "_cls" in kosul:
@@ -91,9 +94,13 @@ def main():
     ap.add_argument("--abl", metavar="MODEL", default=None,
                     help="ornekleme yogunlugu ablasyonu; MODEL = 2.000 patch "
                          "referansi (orn. uni, dinov2)")
+    ap.add_argument("--kosul", metavar="A,B", default=None,
+                    help="yalnizca bu kosullari karsilastir "
+                         "(diger filtreleri atlar)")
     a = ap.parse_args()
 
-    d = kosullari_oku(a.mod, a.abl)
+    secili = set(a.kosul.split(",")) if a.kosul else None
+    d = kosullari_oku(a.mod, a.abl, secili)
     if not d:
         raise SystemExit(f"out/mil/ altinda '{a.mod}' kosulu bulunamadi")
     if a.abl:
