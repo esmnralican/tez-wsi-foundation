@@ -27,10 +27,16 @@ OZET="$DIZIN/ozet.txt"
   echo -n "git     : "
   if git rev-parse --git-dir > /dev/null 2>&1; then
       echo -n "$(git rev-parse --short HEAD)"
-      if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-          echo "  (CALISMA AGACI KIRLI -- kod kaydedilmemis degisiklik iceriyor)"
+      # Yalnizca IZLENEN dosyalardaki degisiklige bakilir: kaynak kaydi
+      # icin onemli olan kodun commit'ten farkli olup olmamasidir.
+      # Izlenmeyen dosyalar (bu scriptin kendi loglar/ klasoru dahil)
+      # sayilmaz.
+      if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+          echo "  (KIRLI -- izlenen dosyalarda kaydedilmemis degisiklik var)"
+          echo "degisen dosyalar:"
+          git status --porcelain --untracked-files=no | sed 's/^/  /'
       else
-          echo "  (temiz)"
+          echo "  (temiz -- kod commit ile ayni)"
       fi
   else
       echo "depo degil"
