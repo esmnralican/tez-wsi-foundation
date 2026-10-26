@@ -53,23 +53,87 @@ IDDIA = {
 IDDIA_HOLM = {"site": 0, "patient": 18}      # Holm sonrasi anlamli sayisi
 IDDIA_ORAN = 3.4                              # site SE / patient SE
 
+# Analize girmesi beklenen TAM kosul kumesi. Kara liste degil BEYAZ LISTE:
+# beklenmeyen bir etiket sessizce analize giremez.
+BEKLENEN = {"uni", "uni_gri", "uni_mac",
+            "virchow", "virchow_gri", "virchow_mac",
+            "dinov2", "dinov2_gri", "dinov2_mac"}
+BEKLENEN_TOHUM = {42, 7, 123, 2024}
+BEKLENEN_FOLD = set(range(5))
+
 
 def oku(mod):
-    """Ham fold_metrics.csv -> {kosul: {(tohum, fold): auc}}"""
+    """Ham fold_metrics.csv -> (veri, yinelenenler, analiz disi etiketler)."""
     d = defaultdict(dict)
-    for f in glob.glob("out/mil/*/fold_metrics.csv"):
+    yinelenen, atlanan = [], []
+    for f in sorted(glob.glob("out/mil/*/fold_metrics.csv")):
         tag = f.split("/")[2]
         m = re.match(rf"^(.+?)_{mod}(_k5|_s(\d+))$", tag)
         if not m:
             continue
         kosul = m.group(1)
-        if (kosul.startswith(("abl_", "renk_")) or "_n100" in kosul
-                or "_cls" in kosul):
+        if kosul not in BEKLENEN:
+            atlanan.append(tag)
             continue
         tohum = int(m.group(3)) if m.group(3) else 42
         for r in csv.DictReader(open(f)):
-            d[kosul][(tohum, int(r["fold"]))] = float(r["auc"])
-    return d
+            anahtar = (tohum, int(r["fold"]))
+            if anahtar in d[kosul]:
+                yinelenen.append((kosul, anahtar, tag))
+            d[kosul][anahtar] = float(r["auc"])
+    return d, yinelenen, atlanan
+
+
+def butunluk(d, yinelenen, atlanan):
+    """Analizden ONCE veri butunlugu. Herhangi bir ihlalde durur."""
+    print("\n[0] VERI BUTUNLUGU")
+    hata = []
+
+    eksik, fazla = BEKLENEN - set(d), set(d) - BEKLENEN
+    print(f"    beklenen / bulunan kosul : {len(BEKLENEN)} / {len(d)}")
+    if eksik:
+        hata.append(f"eksik kosul: {sorted(eksik)}")
+    if fazla:
+        hata.append(f"fazla kosul: {sorted(fazla)}")
+    print(f"    eksik veya fazla         : "
+          f"{'YOK' if not (eksik or fazla) else 'VAR'}")
+
+    boyut = {k: len(v) for k, v in d.items()}
+    print(f"    kosul basina olcum       : {sorted(set(boyut.values()))}")
+    if set(boyut.values()) != {20}:
+        hata.append(f"her kosulda 20 olcum beklenir: {boyut}")
+
+    kumeler = {k: frozenset(v) for k, v in d.items()}
+    ayni = len(set(kumeler.values())) == 1
+    print(f"    (tohum, fold) kumeleri   : "
+          f"{'hepsi ozdes' if ayni else 'FARKLI'}")
+    if not ayni:
+        hata.append("kosullarin anahtar kumeleri ozdes degil")
+
+    if d:
+        ornek = next(iter(kumeler.values()))
+        t = {a for a, _ in ornek}
+        fl = {b for _, b in ornek}
+        print(f"    tohumlar                 : {sorted(t)}")
+        print(f"    fold'lar                 : {sorted(fl)}")
+        if t != BEKLENEN_TOHUM:
+            hata.append(f"tohum kumesi farkli: {sorted(t)}")
+        if fl != BEKLENEN_FOLD:
+            hata.append(f"fold kumesi farkli: {sorted(fl)}")
+
+    print(f"    yinelenen kayit          : {len(yinelenen)}")
+    if yinelenen:
+        hata.append(f"yinelenen (tohum, fold): {yinelenen[:5]}")
+    if atlanan:
+        print(f"    beyaz liste disi etiket  : {len(atlanan)} "
+              f"(orn. {atlanan[:3]})")
+
+    if hata:
+        print("\n    BUTUNLUK HATASI -- analiz durduruldu:")
+        for h in hata:
+            print(f"      - {h}")
+        raise SystemExit(1)
+    print("    -> butunluk DOGRULANDI")
 
 
 def nb(a, b, n_train, ayrinti=False):
@@ -136,16 +200,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mod", default="site", choices=["site", "patient"])
     a = ap.parse_args()
-    d = oku(a.mod)
-    if len(d) < 9:
-        raise SystemExit(f"9 kosul bekleniyordu, {len(d)} bulundu: {sorted(d)}")
+    d, yinelenen, atlanan = oku(a.mod)
+    iddia = IDDIA[a.mod]
+
+    print(f"\n{'='*64}\n{a.mod.upper()} BOLME -- "
+          f"ham fold_metrics.csv dosyalarindan\n{'='*64}")
+    butunluk(d, yinelenen, atlanan)
 
     sirali = sorted(d, key=lambda k: -np.mean(list(d[k].values())))
     A, B = sirali[0], sirali[-1]        # en buyuk kontrast
-    iddia = IDDIA[a.mod]
-
-    print(f"\n{'='*64}\n{a.mod.upper()} BOLME -- {len(d)} kosul, "
-          f"ham fold_metrics.csv dosyalarindan\n{'='*64}")
 
     # ---- 1
     print(f"\n[1] ESLESTIRILMIS TEST MEKANIZMASI")
